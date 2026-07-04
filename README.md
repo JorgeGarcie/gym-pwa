@@ -54,12 +54,39 @@ export. To enable it:
 | Conflicts    | Single-user model: local IndexedDB is source of truth, Drive is a mirror. On connect, remote entries are unioned in by `id`. |
 | Offline      | Service worker (Workbox via `vite-plugin-pwa`) caches the app shell; Drive pushes are skipped while `navigator.onLine` is false and retried on the next change. |
 
+## Testing
+
+Three layers, none of which touch real Google:
+
+| Layer | Tool | File |
+| ----- | ---- | ---- |
+| Pure logic (PRs, grouping, merge, chart data) | Vitest | `src/logic.test.js` |
+| IndexedDB access | Vitest + `fake-indexeddb` (in-memory IndexedDB) | `src/db.test.js` |
+| Drive sync (OAuth + REST) | Vitest with mocked `fetch` + mocked GIS token client | `src/drive.test.js` |
+| Full app (render + persist + reload) | Playwright headless smoke test | `scripts/smoke.mjs` |
+
+The Drive tests mock the two seams `drive.js` depends on — `window.google`'s
+token client and `global.fetch` — and assert we send the right requests
+(create vs. update, multipart body, `Authorization` header) and parse responses
+correctly. Real end-to-end Drive verification is a one-time manual check once you
+have a client ID.
+
+```bash
+npm test            # run unit tests once
+npm run test:watch  # watch mode
+
+# Browser smoke test (needs a built app + preview server):
+npm run build && npm run preview -- --port 4173 &
+node scripts/smoke.mjs
+```
+
 ## Scripts
 
 ```bash
 npm run dev       # dev server
 npm run build     # production build (generates service worker + manifest)
 npm run preview   # serve the production build locally
+npm test          # unit tests (Vitest)
 node scripts/gen-icons.mjs   # regenerate PNG icons from public/icon.svg
 ```
 

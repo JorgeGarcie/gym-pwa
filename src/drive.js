@@ -18,6 +18,11 @@ const FILE_ID_KEY = "gym-tracker-drive-file-id";
 let tokenClient = null;
 let accessToken = null;
 let gisReady = null;
+// The GIS token client is created once, but each connect() needs its OWN
+// resolve/reject. The client's fixed callback dispatches to whichever connect()
+// is currently pending via these slots.
+let pendingResolve = null;
+let pendingReject = null;
 
 // Lazy-load the Google Identity Services script (only when the user opts in).
 function loadGis() {
@@ -52,18 +57,24 @@ export async function connect() {
   }
   await loadGis();
 
+  if (!tokenClient) {
+    tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPE,
+      callback: (resp) => {
+        const resolve = pendingResolve;
+        const reject = pendingReject;
+        pendingResolve = pendingReject = null;
+        if (resp.error) return reject?.(new Error(resp.error));
+        accessToken = resp.access_token;
+        resolve?.();
+      },
+    });
+  }
+
   return new Promise((resolve, reject) => {
-    tokenClient =
-      tokenClient ||
-      window.google.accounts.oauth2.initTokenClient({
-        client_id: CLIENT_ID,
-        scope: SCOPE,
-        callback: (resp) => {
-          if (resp.error) return reject(new Error(resp.error));
-          accessToken = resp.access_token;
-          resolve();
-        },
-      });
+    pendingResolve = resolve;
+    pendingReject = reject;
     // prompt: "" reuses an existing grant silently when possible.
     tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
   });

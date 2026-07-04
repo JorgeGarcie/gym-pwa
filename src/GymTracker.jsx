@@ -1,23 +1,20 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip } from "recharts";
-import { Plus, Trash2, TrendingUp, Dumbbell, Calendar, X, Cloud, CloudOff, Download, RefreshCw } from "lucide-react";
+import { Plus, Trash2, TrendingUp, Dumbbell, Calendar, X, Cloud, CloudOff, Download, RefreshCw, DownloadCloud } from "lucide-react";
 import { getAllEntries, putEntries, deleteEntry as dbDeleteEntry, clearEntries } from "./db";
 import * as drive from "./drive";
-
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const fmtDate = (d) => {
-  const dt = new Date(d + "T00:00:00");
-  return dt.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-};
-
-const timeAgo = (iso) => {
-  if (!iso) return "never";
-  const secs = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-  if (secs < 60) return "just now";
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
-};
+import {
+  todayStr,
+  fmtDate,
+  timeAgo,
+  exerciseNames as computeExerciseNames,
+  entriesForDate,
+  groupByDate,
+  computePRs,
+  buildChartData,
+  mergeById,
+  buildEntries,
+} from "./logic";
 
 export default function GymTracker() {
   const [entries, setEntries] = useState([]);
@@ -103,42 +100,18 @@ export default function GymTracker() {
     [scheduleSync]
   );
 
-  const exerciseNames = useMemo(() => {
-    const set = new Set(entries.map((e) => e.exercise));
-    return Array.from(set).sort();
-  }, [entries]);
+  const exerciseNames = useMemo(() => computeExerciseNames(entries), [entries]);
 
-  const todayEntries = useMemo(
-    () => entries.filter((e) => e.date === todayStr()).sort((a, b) => b.ts - a.ts),
-    [entries]
+  const todayEntries = useMemo(() => entriesForDate(entries, todayStr()), [entries]);
+
+  const groupedByDate = useMemo(() => groupByDate(entries), [entries]);
+
+  const prs = useMemo(() => computePRs(entries), [entries]);
+
+  const chartData = useMemo(
+    () => buildChartData(entries, selectedExercise),
+    [entries, selectedExercise]
   );
-
-  const groupedByDate = useMemo(() => {
-    const groups = {};
-    entries.forEach((e) => {
-      groups[e.date] = groups[e.date] || [];
-      groups[e.date].push(e);
-    });
-    return Object.entries(groups).sort((a, b) => (a[0] < b[0] ? 1 : -1));
-  }, [entries]);
-
-  const prs = useMemo(() => {
-    const best = {};
-    entries.forEach((e) => {
-      if (!best[e.exercise] || e.weight > best[e.exercise].weight) {
-        best[e.exercise] = e;
-      }
-    });
-    return best;
-  }, [entries]);
-
-  const chartData = useMemo(() => {
-    if (!selectedExercise) return [];
-    return entries
-      .filter((e) => e.exercise === selectedExercise)
-      .sort((a, b) => a.ts - b.ts)
-      .map((e) => ({ date: fmtDate(e.date), weight: e.weight, label: `${e.weight}×${e.reps}` }));
-  }, [entries, selectedExercise]);
 
   const addEntry = () => {
     const w = parseFloat(weight);
@@ -153,17 +126,13 @@ export default function GymTracker() {
       return;
     }
     setError("");
-    const newEntries = [];
-    for (let i = 0; i < s; i++) {
-      newEntries.push({
-        id: `${Date.now()}-${i}`,
-        ts: Date.now() + i,
-        date: todayStr(),
-        exercise: exercise.trim(),
-        weight: w,
-        reps: r,
-      });
-    }
+    const newEntries = buildEntries({
+      exercise,
+      weight: w,
+      reps: r,
+      sets: s,
+      date: todayStr(),
+    });
     const next = [...entries, ...newEntries];
     setEntries(next);
     persist(next);
@@ -187,9 +156,7 @@ export default function GymTracker() {
       // On connect, pull remote and merge (last-write-wins by id, union).
       const remote = await drive.pullBackup();
       if (remote?.entries?.length) {
-        const byId = new Map(entries.map((e) => [e.id, e]));
-        remote.entries.forEach((e) => byId.set(e.id, e));
-        const merged = Array.from(byId.values());
+        const merged = mergeById(entries, remote.entries);
         setEntries(merged);
         await persist(merged);
         setLastSynced(remote.updatedAt);
@@ -199,6 +166,34 @@ export default function GymTracker() {
     } catch (e) {
       console.error(e);
       setError(e.message);
+    }
+  };
+
+  // Explicit "restore from Drive": pull the backup and merge it into local.
+  // Unlike connect, this can be re-run any time to pull in another device's logs.
+  const handleRestore = async () => {
+    if (!drive.isConnected()) {
+      await handleConnect();
+      return;
+    }
+    setSyncStatus("syncing");
+    try {
+      const remote = await drive.pullBackup();
+      if (!remote?.entries?.length) {
+        setError("No Drive backup found to restore.");
+        setSyncStatus("idle");
+        return;
+      }
+      const merged = mergeById(entries, remote.entries);
+      setEntries(merged);
+      await clearEntries();
+      await putEntries(merged);
+      setLastSynced(remote.updatedAt);
+      setSyncStatus("idle");
+    } catch (e) {
+      console.error(e);
+      setError(e.message);
+      setSyncStatus("error");
     }
   };
 
@@ -271,9 +266,14 @@ export default function GymTracker() {
               <Download size={15} color="#8B9198" />
             </button>
             {driveConfigured && connected && (
-              <button onClick={handleManualSync} title="Sync now" style={iconBtn}>
-                <RefreshCw size={15} color="#8B9198" className={syncStatus === "syncing" ? "spin" : ""} />
-              </button>
+              <>
+                <button onClick={handleRestore} title="Restore from Drive" style={iconBtn}>
+                  <DownloadCloud size={15} color="#8B9198" />
+                </button>
+                <button onClick={handleManualSync} title="Sync now" style={iconBtn}>
+                  <RefreshCw size={15} color="#8B9198" className={syncStatus === "syncing" ? "spin" : ""} />
+                </button>
+              </>
             )}
             {driveConfigured &&
               (connected ? (
